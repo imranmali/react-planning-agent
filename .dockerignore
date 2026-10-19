@@ -1,0 +1,34 @@
+# VCS, CI and editor metadata
+.git
+.github
+.claude
+.vscode
+.idea
+
+# Virtual environments and secrets
+.venv
+venv
+.env
+
+# Caches and build output
+**/__pycache__
+**/*.py[cod]
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+build
+dist
+*.egg-info
+
+# Not needed to build the wheel
+tests
+openspec
+Dockerfile
+.dockerignore
+
+# Docs: only README.md is needed (pyproject `readme`); LICENSE is kept via `license-files`
+*.md
+!README.md
