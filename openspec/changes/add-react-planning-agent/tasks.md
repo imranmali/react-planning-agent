@@ -2,8 +2,8 @@
 
 ## 1. Project scaffolding
 
-- [ ] 1.1 Add `pyproject.toml` (hatchling, src layout, `react-agent` script, `anthropic` extra, dev tools config) and verify `pip install -e .[dev]` succeeds
-- [ ] 1.2 Add shared contract module `src/react_agent/types.py` and verify `mypy --strict` passes on it
+- [x] 1.1 Add `pyproject.toml` (hatchling, src layout, `react-agent` script, `anthropic` extra, dev tools config) and verify `pip install -e .[dev]` succeeds
+- [x] 1.2 Add shared contract module `src/react_agent/types.py` and verify `mypy --strict` passes on it
 
 ## 2. Tools and parsing (parallel track A)
 
