@@ -146,13 +146,13 @@ from react_agent.types import AgentConfig
 tools = default_registry()
 tools.register(Tool("echo", "Repeat the input back.", lambda text: text))
 
-primary = AnthropicLLM()                      # or any object with .name and .complete(messages)
+primary = AnthropicLLM()  # or any object with .name and .complete(messages)
 agent = ReActAgent(
     primary,
     tools,
     AgentConfig(max_iterations=8, time_budget_seconds=30, max_repeats=3),
-    critic=default_critic(primary),           # heuristic + model-based critique
-    fallbacks=[OfflinePlannerLLM()],          # graceful degradation
+    critic=default_critic(primary),  # heuristic + model-based critique
+    fallbacks=[OfflinePlannerLLM()],  # graceful degradation
 )
 
 result = agent.run("What is the eiffel tower height times 3?")
