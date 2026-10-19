@@ -1,4 +1,4 @@
-"""Model backends: test doubles and a deterministic offline planner.
+"""Model backends: test doubles, an offline planner, a resilience wrapper and Anthropic.
 
 Every class here implements the ``LLMClient`` protocol from ``types``: a ``name`` and a
 ``complete(messages) -> str`` method that returns ReAct-formatted text or raises
@@ -7,11 +7,26 @@ Every class here implements the ``LLMClient`` protocol from ``types``: a ``name`
 
 from __future__ import annotations
 
+import os
 import re
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 from react_agent.prompts import extract_observations, extract_question
-from react_agent.types import LLMError, Message, normalize_input
+from react_agent.types import (
+    ConfigError,
+    LLMClient,
+    LLMError,
+    LLMUnavailableError,
+    Message,
+    normalize_input,
+)
+
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5-5"
+"""Model used by ``AnthropicLLM`` unless overridden by argument or ``REACT_AGENT_MODEL``."""
+
+MODEL_ENV_VAR = "REACT_AGENT_MODEL"
 
 # --------------------------------------------------------------------------- test doubles
 
@@ -209,3 +224,155 @@ class OfflinePlannerLLM:
                 history[-1] = (*pending, observation[0])
                 pending = None
         return history
+
+
+# --------------------------------------------------------------------------- resilience
+
+
+def _describe(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+class ResilientLLM:
+    """Retry each backend with exponential backoff, then fall back to the next one.
+
+    Implements ``LLMClient`` itself, so the agent never knows retries happened; what did
+    happen is recorded in ``notes`` and ``last_backend``. Raises ``LLMUnavailableError``
+    when every backend fails.
+    """
+
+    def __init__(
+        self,
+        primary: LLMClient,
+        fallbacks: Sequence[LLMClient] = (),
+        *,
+        retries: int = 2,
+        backoff_seconds: float = 0.5,
+        max_backoff_seconds: float = 8.0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if retries < 0:
+            raise ConfigError("retries must be >= 0")
+        if backoff_seconds < 0:
+            raise ConfigError("backoff_seconds must be >= 0")
+        if max_backoff_seconds < 0:
+            raise ConfigError("max_backoff_seconds must be >= 0")
+        self.name = primary.name
+        self.retries = retries
+        self.backoff_seconds = backoff_seconds
+        self.max_backoff_seconds = max_backoff_seconds
+        self.notes: list[str] = []
+        self.last_backend: str | None = None
+        self._backends: list[LLMClient] = [primary, *fallbacks]
+        self._sleep = sleep
+        self._fallbacks_noted: set[int] = set()
+
+    def backoff(self, attempt: int) -> float:
+        """Delay after failed attempt number ``attempt`` (0-based) of one backend."""
+        return float(min(self.backoff_seconds * 2**attempt, self.max_backoff_seconds))
+
+    def complete(self, messages: Sequence[Message]) -> str:
+        failures: list[str] = []
+        for position, backend in enumerate(self._backends):
+            role = "primary" if position == 0 else "fallback"
+            attempts = self.retries + 1
+            last_error: Exception | None = None
+            for attempt in range(attempts):
+                if attempt:
+                    self._sleep(self.backoff(attempt - 1))
+                try:
+                    reply = backend.complete(messages)
+                except Exception as exc:  # SDKs raise all sorts; every failure is retryable
+                    last_error = exc
+                    continue
+                if last_error is not None:
+                    self.notes.append(
+                        f"{role} '{backend.name}' recovered on attempt {attempt + 1}/{attempts} "
+                        f"after {_describe(last_error)}"
+                    )
+                if position and position not in self._fallbacks_noted:
+                    self._fallbacks_noted.add(position)
+                    self.notes.append(
+                        f"{'; '.join(failures)}; answered by fallback '{backend.name}'"
+                    )
+                self.last_backend = backend.name
+                return reply
+            assert last_error is not None
+            failures.append(
+                f"{role} '{backend.name}' failed after {attempts} attempt"
+                f"{'s' if attempts > 1 else ''} ({_describe(last_error)})"
+            )
+        self.last_backend = None
+        raise LLMUnavailableError("all models failed: " + "; ".join(failures))
+
+
+# --------------------------------------------------------------------------- anthropic
+
+
+class AnthropicLLM:
+    """Hosted Claude backend via the optional ``anthropic`` SDK (imported lazily).
+
+    Construction raises ``LLMUnavailableError`` when the SDK or credentials are missing,
+    so callers can warn and fall back. Call failures and refusals raise ``LLMError``.
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        *,
+        max_tokens: int = 16000,
+        client: Any | None = None,
+        name: str | None = None,
+    ) -> None:
+        self.model = model or os.environ.get(MODEL_ENV_VAR) or DEFAULT_ANTHROPIC_MODEL
+        self.max_tokens = max_tokens
+        self.name = name or f"anthropic:{self.model}"
+        self._client = client if client is not None else self._default_client()
+
+    @staticmethod
+    def _default_client() -> Any:
+        try:
+            import anthropic
+        except ImportError as exc:
+            raise LLMUnavailableError(
+                "anthropic SDK not installed; pip install 'react-planning-agent[anthropic]'"
+            ) from exc
+        if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
+            raise LLMUnavailableError(
+                "no Anthropic credentials: set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN)"
+            )
+        try:
+            return anthropic.Anthropic()
+        except Exception as exc:
+            raise LLMUnavailableError(f"could not create Anthropic client: {exc}") from exc
+
+    @staticmethod
+    def to_request(messages: Sequence[Message]) -> tuple[str, list[dict[str, str]]]:
+        """Split a conversation into the API's ``system`` text and alternating messages."""
+        system = "\n\n".join(m.content for m in messages if m.role == "system")
+        chat: list[dict[str, str]] = []
+        for message in messages:
+            if message.role == "system":
+                continue
+            if chat and chat[-1]["role"] == message.role:
+                chat[-1]["content"] += "\n\n" + message.content
+            else:
+                chat.append({"role": message.role, "content": message.content})
+        return system, chat
+
+    def complete(self, messages: Sequence[Message]) -> str:
+        system, chat = self.to_request(messages)
+        try:
+            response = self._client.messages.create(
+                model=self.model, max_tokens=self.max_tokens, system=system, messages=chat
+            )
+        except Exception as exc:
+            raise LLMError(f"anthropic call failed: {exc}") from exc
+        if getattr(response, "stop_reason", None) == "refusal":
+            raise LLMError("model refused the request")
+        text = "".join(
+            block.text for block in response.content if getattr(block, "type", None) == "text"
+        )
+        if not text.strip():
+            raise LLMError("model returned no text")
+        return text

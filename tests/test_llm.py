@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from react_agent.llm import (
+    DEFAULT_ANTHROPIC_MODEL,
+    AnthropicLLM,
     OfflinePlannerLLM,
+    ResilientLLM,
     ScriptedLLM,
     StubbornLLM,
     find_expression,
 )
 from react_agent.prompts import build_messages
 from react_agent.types import (
+    ConfigError,
     LLMClient,
     LLMError,
+    LLMUnavailableError,
     Message,
     Step,
 )
@@ -213,3 +221,230 @@ def test_planner_survives_empty_and_odd_conversations() -> None:
 )
 def test_find_expression(text: str, expected: str | None) -> None:
     assert find_expression(text) == expected
+
+
+# --------------------------------------------------------------------------- resilient
+
+
+class FlakyLLM:
+    """Fails ``failures`` times, then answers ``reply`` forever."""
+
+    def __init__(self, name: str, failures: int, reply: str = "ok") -> None:
+        self.name = name
+        self.failures = failures
+        self.reply = reply
+        self.calls = 0
+
+    def complete(self, messages: Sequence[Message]) -> str:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise RuntimeError(f"{self.name} down #{self.calls}")
+        return self.reply
+
+
+def test_resilient_primary_recovers_on_retry() -> None:
+    sleeps: list[float] = []
+    primary = FlakyLLM("primary", failures=1, reply="Final Answer: 84")
+    llm = ResilientLLM(primary, sleep=sleeps.append)
+    assert llm.complete([]) == "Final Answer: 84"
+    assert primary.calls == 2
+    assert sleeps == [0.5]
+    assert llm.last_backend == "primary"
+    assert llm.name == "primary"
+    assert llm.notes == [
+        "primary 'primary' recovered on attempt 2/3 after RuntimeError: primary down #1"
+    ]
+
+
+def test_resilient_uses_fallback_and_notes_it_once() -> None:
+    sleeps: list[float] = []
+    primary = FlakyLLM("main", failures=100)
+    fallback = FlakyLLM("backup", failures=0, reply="from backup")
+    llm = ResilientLLM(primary, [fallback], retries=2, sleep=sleeps.append)
+    assert llm.complete([]) == "from backup"
+    assert llm.complete([]) == "from backup"
+    assert primary.calls == 6
+    assert sleeps == [0.5, 1.0, 0.5, 1.0]
+    assert llm.last_backend == "backup"
+    assert llm.notes == [
+        "primary 'main' failed after 3 attempts (RuntimeError: main down #3); "
+        "answered by fallback 'backup'"
+    ]
+
+
+def test_resilient_all_backends_fail() -> None:
+    llm = ResilientLLM(
+        FlakyLLM("a", failures=100), [FlakyLLM("b", failures=100)], retries=0, sleep=lambda _: None
+    )
+    with pytest.raises(LLMUnavailableError) as info:
+        llm.complete([])
+    message = str(info.value)
+    assert "primary 'a' failed after 1 attempt (RuntimeError: a down #1)" in message
+    assert "fallback 'b' failed after 1 attempt (RuntimeError: b down #1)" in message
+    assert llm.last_backend is None
+    assert isinstance(info.value, LLMError)
+
+
+def test_resilient_backoff_is_exponential_and_capped() -> None:
+    sleeps: list[float] = []
+    llm = ResilientLLM(
+        FlakyLLM("x", failures=100),
+        retries=4,
+        backoff_seconds=1.0,
+        max_backoff_seconds=5.0,
+        sleep=sleeps.append,
+    )
+    with pytest.raises(LLMUnavailableError):
+        llm.complete([])
+    assert sleeps == [1.0, 2.0, 4.0, 5.0]
+
+
+def test_resilient_default_sleep_is_real_but_unused_on_success() -> None:
+    assert ResilientLLM(ScriptedLLM(["hi"])).complete([]) == "hi"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"retries": -1}, {"backoff_seconds": -0.1}, {"max_backoff_seconds": -1.0}],
+)
+def test_resilient_rejects_invalid_config(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ConfigError):
+        ResilientLLM(ScriptedLLM([]), **kwargs)
+
+
+# --------------------------------------------------------------------------- anthropic
+
+
+class FakeMessages:
+    def __init__(self, response: Any = None, error: Exception | None = None) -> None:
+        self.response = response
+        self.error = error
+        self.requests: list[dict[str, Any]] = []
+
+    def create(self, **kwargs: Any) -> Any:
+        self.requests.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def text_response(*texts: str, stop_reason: str = "end_turn") -> SimpleNamespace:
+    blocks = [SimpleNamespace(type="thinking", thinking="")]
+    blocks += [SimpleNamespace(type="text", text=t) for t in texts]
+    return SimpleNamespace(stop_reason=stop_reason, content=blocks)
+
+
+def fake_client(messages: FakeMessages) -> SimpleNamespace:
+    return SimpleNamespace(messages=messages)
+
+
+@pytest.fixture
+def no_model_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REACT_AGENT_MODEL", raising=False)
+
+
+@pytest.mark.usefixtures("no_model_env")
+def test_anthropic_request_shape_and_reply() -> None:
+    api = FakeMessages(text_response("Thought: x\n", "Final Answer: 84"))
+    llm = AnthropicLLM(client=fake_client(api))
+    messages = [
+        Message("system", "rules"),
+        Message("system", "more rules"),
+        Message("user", "Question: q"),
+        Message("assistant", "Action: a[b]"),
+        Message("user", "Observation: o"),
+        Message("user", "extra"),
+    ]
+    assert llm.complete(messages) == "Thought: x\nFinal Answer: 84"
+    assert llm.name == f"anthropic:{DEFAULT_ANTHROPIC_MODEL}"
+    assert api.requests == [
+        {
+            "model": DEFAULT_ANTHROPIC_MODEL,
+            "max_tokens": 16000,
+            "system": "rules\n\nmore rules",
+            "messages": [
+                {"role": "user", "content": "Question: q"},
+                {"role": "assistant", "content": "Action: a[b]"},
+                {"role": "user", "content": "Observation: o\n\nextra"},
+            ],
+        }
+    ]
+
+
+def test_anthropic_model_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = fake_client(FakeMessages())
+    monkeypatch.setenv("REACT_AGENT_MODEL", "env-model")
+    assert AnthropicLLM(client=client).model == "env-model"
+    llm = AnthropicLLM("arg-model", max_tokens=10, client=client, name="custom")
+    assert (llm.model, llm.max_tokens, llm.name) == ("arg-model", 10, "custom")
+
+
+@pytest.mark.usefixtures("no_model_env")
+def test_anthropic_refusal_raises() -> None:
+    api = FakeMessages(text_response("partial", stop_reason="refusal"))
+    with pytest.raises(LLMError, match="refused"):
+        AnthropicLLM(client=fake_client(api)).complete([Message("user", "q")])
+
+
+@pytest.mark.usefixtures("no_model_env")
+def test_anthropic_empty_text_raises() -> None:
+    api = FakeMessages(text_response("  "))
+    with pytest.raises(LLMError, match="no text"):
+        AnthropicLLM(client=fake_client(api)).complete([Message("user", "q")])
+
+
+@pytest.mark.usefixtures("no_model_env")
+def test_anthropic_wraps_sdk_errors() -> None:
+    cause = RuntimeError("rate limited")
+    api = FakeMessages(error=cause)
+    with pytest.raises(LLMError, match="anthropic call failed: rate limited") as info:
+        AnthropicLLM(client=fake_client(api)).complete([Message("user", "q")])
+    assert info.value.__cause__ is cause
+    assert not isinstance(info.value, LLMUnavailableError)
+
+
+def test_anthropic_missing_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "anthropic", None)
+    with pytest.raises(LLMUnavailableError, match="anthropic SDK not installed"):
+        AnthropicLLM()
+
+
+class FakeAnthropic:
+    """Stands in for ``anthropic.Anthropic``."""
+
+    def __init__(self) -> None:
+        self.messages = FakeMessages(text_response("hi"))
+
+
+class BrokenAnthropic:
+    def __init__(self) -> None:
+        raise RuntimeError("bad base url")
+
+
+@pytest.fixture
+def no_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+
+
+@pytest.mark.usefixtures("no_credentials")
+def test_anthropic_missing_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+    with pytest.raises(LLMUnavailableError, match="ANTHROPIC_API_KEY"):
+        AnthropicLLM()
+
+
+@pytest.mark.usefixtures("no_credentials", "no_model_env")
+@pytest.mark.parametrize("variable", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_anthropic_builds_default_client(monkeypatch: pytest.MonkeyPatch, variable: str) -> None:
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=FakeAnthropic))
+    monkeypatch.setenv(variable, "secret")
+    assert AnthropicLLM().complete([Message("user", "q")]) == "hi"
+
+
+@pytest.mark.usefixtures("no_credentials")
+def test_anthropic_client_construction_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "anthropic", SimpleNamespace(Anthropic=BrokenAnthropic))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+    with pytest.raises(LLMUnavailableError, match="bad base url"):
+        AnthropicLLM()
